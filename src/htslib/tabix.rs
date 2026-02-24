@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use super::bgzf::BgzfReader;
+use super::bgzf::{BgzfReader, BgzfWriter};
 
 // ---------------------------------------------------------------------------
 // GFF3 preset constants (hts_idx_t TBX_GENERIC/TBX_GFF)
@@ -105,7 +105,7 @@ impl SeqIdx {
 ///
 /// Reads from `bgzf_input` (a BGZF-compressed byte stream) and writes the
 /// binary `.tbi` index to `tbi_output`.
-pub fn tabix_index_gff<R: Read, W: Write>(bgzf_input: R, mut tbi_output: W) -> io::Result<()> {
+pub fn tabix_index_gff<R: Read, W: Write>(bgzf_input: R, tbi_output: W) -> io::Result<()> {
     let mut reader = BgzfReader::new(bgzf_input);
 
     let mut seqs: Vec<SeqIdx> = Vec::new();
@@ -181,22 +181,23 @@ pub fn tabix_index_gff<R: Read, W: Write>(bgzf_input: R, mut tbi_output: W) -> i
     }
 
     // -----------------------------------------------------------------------
-    // Write the .tbi binary format (all little-endian)
+    // Write the .tbi binary format (all little-endian), BGZF-compressed
     // -----------------------------------------------------------------------
+    let mut w = BgzfWriter::new(tbi_output);
 
     // Magic
-    tbi_output.write_all(b"TBI\x01")?;
+    w.write_all(b"TBI\x01")?;
 
     // n_ref
-    write_i32(&mut tbi_output, seqs.len() as i32)?;
+    write_i32(&mut w, seqs.len() as i32)?;
 
     // Header: format, col_seq, col_beg, col_end, meta_char, skip
-    write_i32(&mut tbi_output, FORMAT)?;
-    write_i32(&mut tbi_output, COL_SEQ)?;
-    write_i32(&mut tbi_output, COL_BEG)?;
-    write_i32(&mut tbi_output, COL_END)?;
-    write_i32(&mut tbi_output, META_CHAR)?;
-    write_i32(&mut tbi_output, SKIP)?;
+    write_i32(&mut w, FORMAT)?;
+    write_i32(&mut w, COL_SEQ)?;
+    write_i32(&mut w, COL_BEG)?;
+    write_i32(&mut w, COL_END)?;
+    write_i32(&mut w, META_CHAR)?;
+    write_i32(&mut w, SKIP)?;
 
     // l_nm + names (null-terminated, concatenated)
     let mut names_buf: Vec<u8> = Vec::new();
@@ -204,8 +205,8 @@ pub fn tabix_index_gff<R: Read, W: Write>(bgzf_input: R, mut tbi_output: W) -> i
         names_buf.extend_from_slice(seq.name.as_bytes());
         names_buf.push(0);
     }
-    write_i32(&mut tbi_output, names_buf.len() as i32)?;
-    tbi_output.write_all(&names_buf)?;
+    write_i32(&mut w, names_buf.len() as i32)?;
+    w.write_all(&names_buf)?;
 
     // Per-sequence index data
     for seq in &seqs {
@@ -213,26 +214,27 @@ pub fn tabix_index_gff<R: Read, W: Write>(bgzf_input: R, mut tbi_output: W) -> i
         let mut bin_ids: Vec<u32> = seq.bins.keys().cloned().collect();
         bin_ids.sort_unstable();
 
-        write_i32(&mut tbi_output, bin_ids.len() as i32)?;
+        write_i32(&mut w, bin_ids.len() as i32)?;
         for bin in &bin_ids {
             let chunks = &seq.bins[bin];
-            tbi_output.write_all(&bin.to_le_bytes())?;
-            write_i32(&mut tbi_output, chunks.len() as i32)?;
+            w.write_all(&bin.to_le_bytes())?;
+            write_i32(&mut w, chunks.len() as i32)?;
             for chunk in chunks {
-                tbi_output.write_all(&chunk.start.to_le_bytes())?;
-                tbi_output.write_all(&chunk.end.to_le_bytes())?;
+                w.write_all(&chunk.start.to_le_bytes())?;
+                w.write_all(&chunk.end.to_le_bytes())?;
             }
         }
 
         // Linear index
-        write_i32(&mut tbi_output, seq.lidx.len() as i32)?;
+        write_i32(&mut w, seq.lidx.len() as i32)?;
         for &slot in &seq.lidx {
-            tbi_output.write_all(&slot.to_le_bytes())?;
+            w.write_all(&slot.to_le_bytes())?;
         }
     }
 
     // n_no_coor (unaligned read count) = 0
-    tbi_output.write_all(&0u64.to_le_bytes())?;
+    w.write_all(&0u64.to_le_bytes())?;
+    w.finish()?;
 
     Ok(())
 }

@@ -137,8 +137,10 @@ impl<W: Write> Write for BgzfWriter<W> {
 
 pub struct BgzfReader<R: Read> {
     inner: R,
-    /// Compressed bytes consumed before the current block.
+    /// Compressed bytes consumed so far (= start of the *next* unread block).
     pub block_address: u64,
+    /// Compressed start offset of the block currently loaded in `block`.
+    cur_block_start: u64,
     /// Decompressed contents of the current block.
     block: Vec<u8>,
     /// Read position within block.
@@ -154,6 +156,7 @@ impl<R: Read> BgzfReader<R> {
         BgzfReader {
             inner,
             block_address: 0,
+            cur_block_start: 0,
             block: Vec::new(),
             pos: 0,
             gzi: Vec::new(),
@@ -161,9 +164,9 @@ impl<R: Read> BgzfReader<R> {
         }
     }
 
-    /// Current virtual offset: (block_address << 16) | pos
+    /// Current virtual offset: (start_of_current_block << 16) | pos
     pub fn virtual_offset(&self) -> u64 {
-        (self.block_address << 16) | (self.pos as u64)
+        (self.cur_block_start << 16) | (self.pos as u64)
     }
 
     /// GZI block entries collected during reading.
@@ -224,11 +227,13 @@ impl<R: Read> BgzfReader<R> {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "BGZF CRC32 mismatch"));
         }
 
+        self.cur_block_start = caddr_before;
         self.block_address += bsize as u64;
         self.pos = 0;
 
-        // Record GZI entry (skip the implicit (0,0) entry for the first block)
-        if caddr_before > 0 || uaddr_before > 0 {
+        // Record GZI entry: skip the implicit (0,0) first-block entry and skip
+        // the empty EOF block (isize==0).
+        if !self.block.is_empty() && (caddr_before > 0 || uaddr_before > 0) {
             self.gzi.push((caddr_before, uaddr_before));
         }
         self.uncompressed_addr += self.block.len() as u64;
@@ -240,17 +245,17 @@ impl<R: Read> BgzfReader<R> {
     /// Returns `(bytes_read, voff_at_line_start)`.
     /// Returns `(0, voff)` on EOF.
     pub fn read_line(&mut self, buf: &mut Vec<u8>) -> io::Result<(usize, u64)> {
+        // Advance past an exhausted block *before* capturing voff_start, so that
+        // the virtual offset reflects the actual block the line starts in.
+        if self.pos >= self.block.len() {
+            let got = self.read_block()?;
+            if !got || self.block.is_empty() {
+                return Ok((0, self.virtual_offset()));
+            }
+        }
         let voff_start = self.virtual_offset();
         let mut total = 0usize;
         loop {
-            // Ensure we have data in the block buffer
-            if self.pos >= self.block.len() {
-                let got = self.read_block()?;
-                if !got || self.block.is_empty() {
-                    // EOF block (isize==0) or real EOF
-                    return Ok((total, voff_start));
-                }
-            }
             // Scan for newline in current block
             let slice = &self.block[self.pos..];
             match slice.iter().position(|&b| b == b'\n') {
@@ -265,7 +270,11 @@ impl<R: Read> BgzfReader<R> {
                     buf.extend_from_slice(slice);
                     total += slice.len();
                     self.pos = self.block.len();
-                    // Loop to read next block
+                    // Load next block and continue
+                    let got = self.read_block()?;
+                    if !got || self.block.is_empty() {
+                        return Ok((total, voff_start));
+                    }
                 }
             }
         }

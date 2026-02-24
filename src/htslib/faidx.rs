@@ -32,7 +32,7 @@ pub fn faidx_index_fasta<R: Read, F: Write, G: Write>(
                              seq_offset: u64,
                              line_blen: usize,
                              line_len: usize| -> io::Result<()> {
-        let line = format!("{}\t{}\t{}\t{}\t{}\n", name, seq_len, seq_offset, line_blen, line_len);
+        let line = format!("{}\t{}\t{}\t{}\t{}\n", name, seq_len, seq_offset, line_len, line_blen);
         fai.write_all(line.as_bytes())
     };
 
