@@ -32,22 +32,21 @@ pub fn index_gff_tbi(bgzf_input: &[u8]) -> Vec<u8> {
 }
 
 /// Result of indexing a BGZF-compressed FASTA file.
-/// Fields are exposed via getter methods because `Vec<u8>` is not `Copy`.
 #[wasm_bindgen]
 pub struct FaidxResult {
-    fai: Vec<u8>,
-    gzi: Vec<u8>,
+    pub(crate) fai: Vec<u8>,
+    pub(crate) gzi: Vec<u8>,
 }
 
 #[wasm_bindgen]
 impl FaidxResult {
-    /// Returns the `.fai` index bytes.
-    pub fn fai(&self) -> Vec<u8> {
-        self.fai.clone()
+    /// Moves the `.fai` index bytes out. May only be called once meaningfully.
+    pub fn fai(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.fai)
     }
-    /// Returns the `.gzi` index bytes.
-    pub fn gzi(&self) -> Vec<u8> {
-        self.gzi.clone()
+    /// Moves the `.gzi` index bytes out. May only be called once meaningfully.
+    pub fn gzi(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.gzi)
     }
 }
 
