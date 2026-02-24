@@ -8,7 +8,7 @@ extern crate console_error_panic_hook;
 mod decompress;
 
 pub mod htslib;
-use crate::htslib::{compress_bgzf, index_gff_tbi, index_fasta_fai};
+use crate::htslib::{compress_bgzf, index_gff_tbi, index_fasta_fai, FaidxResult};
 
 #[wasm_bindgen]
 extern "C" {
@@ -32,6 +32,13 @@ pub fn logw(text : &str, typ : Option<&str>) {
 /// Function that allows to propagate panic error messages when compiling to wasm, see https://github.com/rustwasm/console_error_panic_hook
 pub fn init_panic_hook() {
     console_error_panic_hook::set_once();
+}
+
+/// Convert an owned `Vec<u8>` into a JS `Blob` with one copy (Rust heap → JS heap).
+fn vec_to_blob(data: Vec<u8>) -> Result<web_sys::Blob, JsValue> {
+    let arr = js_sys::Uint8Array::from(data.as_slice());
+    let seq = js_sys::Array::of1(&arr);
+    web_sys::Blob::new_with_u8_array_sequence(&seq)
 }
 
 #[wasm_bindgen]
@@ -73,7 +80,7 @@ impl IndexGen {
         // bgzip
         let fasta_bgz = compress_bgzf(&fa_bytes);
         // faidx
-        let faidx = index_fasta_fai(&fasta_bgz);
+        let FaidxResult { fai: fasta_fai, gzi: fasta_gzi } = index_fasta_fai(&fasta_bgz);
 
         // Output gff files
         logw("Compressing and indexing gff", None);
@@ -83,11 +90,36 @@ impl IndexGen {
 
         Self {
             fasta_bgz,
-            fasta_fai: faidx.fai(),
-            fasta_gzi: faidx.gzi(),
+            fasta_fai,
+            fasta_gzi,
             gff_bgz,
             gff_idx,
         }
+    }
+
+    /// Returns the BGZF-compressed FASTA as a Blob. Drains the field; call once.
+    pub fn fasta_bgz_blob(&mut self) -> Result<web_sys::Blob, JsValue> {
+        vec_to_blob(std::mem::take(&mut self.fasta_bgz))
+    }
+
+    /// Returns the FASTA `.fai` index as a Blob. Drains the field; call once.
+    pub fn fasta_fai_blob(&mut self) -> Result<web_sys::Blob, JsValue> {
+        vec_to_blob(std::mem::take(&mut self.fasta_fai))
+    }
+
+    /// Returns the FASTA `.gzi` block index as a Blob. Drains the field; call once.
+    pub fn fasta_gzi_blob(&mut self) -> Result<web_sys::Blob, JsValue> {
+        vec_to_blob(std::mem::take(&mut self.fasta_gzi))
+    }
+
+    /// Returns the BGZF-compressed GFF3 as a Blob. Drains the field; call once.
+    pub fn gff_bgz_blob(&mut self) -> Result<web_sys::Blob, JsValue> {
+        vec_to_blob(std::mem::take(&mut self.gff_bgz))
+    }
+
+    /// Returns the GFF3 `.tbi` tabix index as a Blob. Drains the field; call once.
+    pub fn gff_tbi_blob(&mut self) -> Result<web_sys::Blob, JsValue> {
+        vec_to_blob(std::mem::take(&mut self.gff_idx))
     }
 }
 
