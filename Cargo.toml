@@ -26,6 +26,10 @@ log                      = {version = "0.4.27"}
 pretty_assertions = "1.4.1"
 stacker = "0.1.20"
 
+[[example]]
+name = "gen_references"
+path = "examples/gen_references.rs"
+
 
 [profile.release]
 lto = true
