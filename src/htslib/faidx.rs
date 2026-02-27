@@ -88,8 +88,9 @@ pub fn faidx_index_fasta<R: Read, F: Write, G: Write>(
             cur_seq_len = 0;
             cur_line_blen = 0;
             cur_line_len = 0;
-            // seq_offset is the virtual offset *after* the header line
-            cur_seq_offset = reader.virtual_offset();
+            // seq_offset is the uncompressed byte position of the first base,
+            // which is what samtools faidx stores (not a BGZF virtual offset).
+            cur_seq_offset = reader.uncompressed_offset();
             first_data_line = true;
         } else {
             // Data line

@@ -169,6 +169,13 @@ impl<R: Read> BgzfReader<R> {
         (self.cur_block_start << 16) | (self.pos as u64)
     }
 
+    /// Current position as a plain uncompressed byte offset.
+    /// Equal to the sum of all decompressed block sizes read so far, minus
+    /// the unread portion of the current block.
+    pub fn uncompressed_offset(&self) -> u64 {
+        self.uncompressed_addr - self.block.len() as u64 + self.pos as u64
+    }
+
     /// GZI block entries collected during reading.
     pub fn gzi_entries(&self) -> &[(u64, u64)] {
         &self.gzi
@@ -245,15 +252,16 @@ impl<R: Read> BgzfReader<R> {
     /// Returns `(bytes_read, voff_at_line_start)`.
     /// Returns `(0, voff)` on EOF.
     pub fn read_line(&mut self, buf: &mut Vec<u8>) -> io::Result<(usize, u64)> {
-        // Advance past an exhausted block *before* capturing voff_start, so that
-        // the virtual offset reflects the actual block the line starts in.
+        // Capture voff_start *before* any block load, matching htslib's bgzf_tell()
+        // behaviour: consecutive lines have contiguous virtual-offset ranges so that
+        // chunk merging works correctly in the CSI/TBI index builder.
+        let voff_start = self.virtual_offset();
         if self.pos >= self.block.len() {
             let got = self.read_block()?;
             if !got || self.block.is_empty() {
-                return Ok((0, self.virtual_offset()));
+                return Ok((0, voff_start));
             }
         }
-        let voff_start = self.virtual_offset();
         let mut total = 0usize;
         loop {
             // Scan for newline in current block
@@ -264,6 +272,16 @@ impl<R: Read> BgzfReader<R> {
                     buf.extend_from_slice(&slice[..end]);
                     self.pos += end;
                     total += end;
+                    // When the newline lands at the very end of a block, eagerly
+                    // load the next block before returning.  This matches htslib's
+                    // bgzf_readline / bgzf_read convention: bgzf_tell() always
+                    // returns the canonical (next_block_start << 16) | 0 form
+                    // rather than (cur_block_start << 16) | block_len.  The CSI
+                    // chunk-end virtual offsets must use this same convention so
+                    // that our index matches tabix output byte-for-byte.
+                    if self.pos == self.block.len() {
+                        let _ = self.read_block(); // ignore EOF/error; next call will surface it
+                    }
                     return Ok((total, voff_start));
                 }
                 None => {

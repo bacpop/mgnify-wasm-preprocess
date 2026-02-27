@@ -6,7 +6,7 @@ mod tabix;
 mod faidx;
 
 pub use bgzf::{BgzfWriter, BgzfReader, bgzf_compress};
-pub use tabix::tabix_index_gff;
+pub use tabix::csi_index_gff;
 pub use faidx::faidx_index_fasta;
 
 // ---------------------------------------------------------------------------
@@ -22,13 +22,13 @@ pub fn compress_bgzf(input: &[u8]) -> Vec<u8> {
     output
 }
 
-/// Build a tabix `.tbi` index from a BGZF-compressed GFF3 byte slice.
+/// Build a tabix `.csi` index from a BGZF-compressed GFF3 byte slice.
 #[wasm_bindgen]
-pub fn index_gff_tbi(bgzf_input: &[u8]) -> Vec<u8> {
-    let mut tbi = Vec::new();
-    tabix_index_gff(Cursor::new(bgzf_input), &mut tbi)
-        .expect("tabix_index_gff failed");
-    tbi
+pub fn index_gff_csi(bgzf_input: &[u8]) -> Vec<u8> {
+    let mut csi = Vec::new();
+    csi_index_gff(Cursor::new(bgzf_input), &mut csi)
+        .expect("csi_index_gff failed");
+    csi
 }
 
 /// Result of indexing a BGZF-compressed FASTA file.

@@ -3,51 +3,89 @@ use std::io::{self, Read, Write};
 use super::bgzf::{BgzfReader, BgzfWriter};
 
 // ---------------------------------------------------------------------------
-// GFF3 preset constants (hts_idx_t TBX_GENERIC/TBX_GFF)
+// CSI format constants (tabix -C -p gff, htslib default)
 // ---------------------------------------------------------------------------
-const COL_SEQ: i32 = 1;
-const COL_BEG: i32 = 4;
-const COL_END: i32 = 5;
-const META_CHAR: i32 = b'#' as i32;
-const SKIP: i32 = 0;
 const MIN_SHIFT: u32 = 14;
-const N_LVLS: u32 = 5;
-const FORMAT: i32 = 0; // TBX_GENERIC
+/// Number of index levels used by `tabix -C` for GFF (= 8).
+/// Covers coordinates up to 2^(14+3*8) = 2^38 ≈ 274 GB.
+const N_LVLS: u32 = 8;
+/// Number of regular bins: hts_bin_first(N_LVLS+1) = ((1<<27)-1)/7 = 19173961.
+const N_BINS: u32 = 19_173_961;
+/// Pseudo-bin for per-sequence metadata (N_BINS + 1).
+const META_BIN: u32 = 19_173_962;
+
+/// Minimum compressed-byte span for a bin to be kept at its level rather than
+/// merged into its parent (= HTS_MIN_MARKER_DIST = 0x10000 = one BGZF block).
+const HTS_MIN_MARKER_DIST: u64 = 0x10000;
 
 // ---------------------------------------------------------------------------
-// Binning scheme (hts_reg2bin equivalent)
+// Binning helpers
+// ---------------------------------------------------------------------------
+
+/// First bin number at level l.
+/// l=0 → 0, l=1 → 1, l=2 → 9, l=3 → 73, l=4 → 585, l=5 → 4681,
+/// l=6 → 37449, l=7 → 299593, l=8 → 2396745, l=9 → 19173961.
+fn hts_bin_first(l: u32) -> u32 {
+    ((1u32 << (3 * l)) - 1) / 7
+}
+
+/// Parent bin of b (htslib: (b-1) >> 3).
+fn hts_bin_parent(b: u32) -> u32 {
+    (b - 1) >> 3
+}
+
+/// Level of bin b: count parent steps from b until reaching 0.
+fn hts_bin_level(b: u32) -> u32 {
+    let mut b = b;
+    let mut level = 0;
+    while b > 0 {
+        b = (b - 1) >> 3;
+        level += 1;
+    }
+    level
+}
+
+/// Bottom linear-index slot covered by bin b (with N_LVLS levels).
+fn hts_bin_bot(b: u32) -> u64 {
+    let level = hts_bin_level(b);
+    let offset = b - hts_bin_first(level);
+    (offset as u64) << ((N_LVLS - level) * 3)
+}
+
+/// Compute loff for a bin: lidx[hts_bin_bot(bin)], falling back to the last
+/// non-zero lidx entry (mirrors htslib update_loff).
+fn compute_loff(bin: u32, lidx: &[u64]) -> u64 {
+    if bin >= N_BINS {
+        return 0;
+    }
+    // offset0 = last non-zero lidx entry (fallback when bot slot is 0)
+    let offset0 = lidx.iter().rev().find(|&&v| v != 0).copied().unwrap_or(0);
+    let bot = hts_bin_bot(bin) as usize;
+    let val = if bot < lidx.len() { lidx[bot] } else { 0 };
+    if val != 0 { val } else { offset0 }
+}
+
+// ---------------------------------------------------------------------------
+// Binning scheme: old BAM / htslib reg2bin — finest-level first
 // ---------------------------------------------------------------------------
 
 /// Compute the bin number for a 0-based half-open interval [beg, end).
-/// Uses the same scheme as hts_reg2bin(beg, end, min_shift=14, n_lvls=5).
+///
+/// Uses the same finest-first algorithm as TBI / htslib `hts_reg2bin` (old BAM
+/// style), extended to N_LVLS=8 levels.  A feature is placed in the finest bin
+/// whose span fully contains [beg, end-1].
 fn reg2bin(beg: u64, end: u64) -> u32 {
-    // t = offset of first bin at each level:
-    // level k: offset = sum_{i=1}^{k} 8^i = (8^(k+1) - 8) / 7
-    // For min_shift=14, n_lvls=5:
-    //   level 5 (finest): bin offset starts at (8^5 - 8)/7 + ... but we use
-    //   the htslib formula directly.
-    //
-    // hts_reg2bin counts from the bottom (finest) up:
-    //   start with s = min_shift, t = accumulated offset at finest level
-    //   t for 5 levels: (8^5 - 1)/7 = 4681 - 0 = 4681? Let's compute:
-    //   total bins = sum_{k=0}^{5} 8^k = (8^6 - 1)/7 = 37449
-    //   finest-level offset = 37449 - 8^5 = 37449 - 32768 = 4681
-    let mut e = end.saturating_sub(1);
-    let mut s: u32 = MIN_SHIFT;
-    // offset of the finest level: (8^(n_lvls+1) - 1)/7 - 8^n_lvls
-    // For n_lvls=5: (8^6-1)/7 - 8^5 = 37449 - 32768 = 4681
-    // But htslib accumulates from finest down; we replicate the loop:
-    let mut t: u64 = ((1u64 << (3 * N_LVLS + 3)) - 1) / 7; // = 37449 for n_lvls=5
-    // The loop goes from finest level (n_lvls) down to 1
+    let e = end.saturating_sub(1);
+    let mut s: u32 = MIN_SHIFT; // 14
+    // t starts at hts_bin_first(N_LVLS+1) = hts_bin_first(9) = 19173961
+    let mut t: u64 = ((1u64 << (3 * N_LVLS + 3)) - 1) / 7;
     for l in (1..=N_LVLS).rev() {
         t -= 1u64 << (3 * l);
         if (beg >> s) == (e >> s) {
             return (t + (beg >> s)) as u32;
         }
         s += 3;
-        e >>= 0; // already computed above
     }
-    // Level 0 (whole sequence): bin 0
     0
 }
 
@@ -64,7 +102,13 @@ struct Chunk {
 struct SeqIdx {
     name: String,
     bins: HashMap<u32, Vec<Chunk>>,
-    lidx: Vec<u64>, // one slot per 16384 bp window
+    lidx: Vec<u64>,
+    /// Smallest virtual offset of any feature start in this sequence.
+    min_voff: u64,
+    /// Largest virtual offset of any feature end in this sequence.
+    max_voff: u64,
+    /// Count of data records (features) for this sequence (→ pseudo-bin n_mapped).
+    n_mapped: u64,
 }
 
 impl SeqIdx {
@@ -73,10 +117,20 @@ impl SeqIdx {
             name,
             bins: HashMap::new(),
             lidx: Vec::new(),
+            min_voff: u64::MAX,
+            max_voff: 0,
+            n_mapped: 0,
         }
     }
 
     fn add_chunk(&mut self, bin: u32, chunk: Chunk) {
+        if chunk.start < self.min_voff {
+            self.min_voff = chunk.start;
+        }
+        if chunk.end > self.max_voff {
+            self.max_voff = chunk.end;
+        }
+        self.n_mapped += 1;
         self.bins.entry(bin).or_default().push(chunk);
     }
 
@@ -98,14 +152,92 @@ impl SeqIdx {
 }
 
 // ---------------------------------------------------------------------------
+// compress_binning: replicates htslib's compress_binning + chunk-merging
+// ---------------------------------------------------------------------------
+
+/// Merge chunks whose virtual-offset gap is ≤ HTS_MIN_MARKER_DIST,
+/// mirroring htslib's criterion: `next.start <= prev.end + HTS_MIN_MARKER_DIST`.
+fn merge_chunks_block_adjacent(chunks: &mut Vec<Chunk>) {
+    if chunks.len() <= 1 {
+        return;
+    }
+    chunks.sort_unstable_by_key(|c| c.start);
+    let mut out: Vec<Chunk> = Vec::new();
+    for c in chunks.drain(..) {
+        match out.last_mut() {
+            Some(last) if c.start <= last.end.saturating_add(HTS_MIN_MARKER_DIST) => {
+                if c.end > last.end {
+                    last.end = c.end;
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    *chunks = out;
+}
+
+/// Replicate htslib compress_binning:
+///
+/// 1. First pass (level N_LVLS → 1): roll fine bins into their parent when the
+///    bin's compressed-byte span is less than HTS_MIN_MARKER_DIST AND the parent
+///    bin already exists in the map.
+/// 2. Second pass: merge block-adjacent chunks within every remaining bin.
+fn compress_binning(bins: &mut HashMap<u32, Vec<Chunk>>) {
+    // Sort all existing bins' chunks before starting.
+    for chunks in bins.values_mut() {
+        chunks.sort_unstable_by_key(|c| c.start);
+    }
+
+    // First pass: level-based rollup, finest → coarsest.
+    for l in (1..=N_LVLS).rev() {
+        let level_first = hts_bin_first(l);
+        let level_last = hts_bin_first(l + 1); // exclusive upper bound
+
+        // Collect bins at this level (avoid borrowing bins while we mutate it).
+        let candidates: Vec<u32> = bins
+            .keys()
+            .filter(|&&b| b >= level_first && b < level_last)
+            .cloned()
+            .collect();
+
+        for b in candidates {
+            let parent = hts_bin_parent(b);
+            if !bins.contains_key(&parent) {
+                continue;
+            }
+            // Compute compressed-byte span of this bin.
+            let chunks = bins.get(&b).unwrap();
+            if chunks.is_empty() {
+                continue;
+            }
+            let first_start = chunks.iter().map(|c| c.start).min().unwrap();
+            let last_end   = chunks.iter().map(|c| c.end).max().unwrap();
+            let span = (last_end >> 16).saturating_sub(first_start >> 16);
+            if span < HTS_MIN_MARKER_DIST {
+                // Remove child and extend parent.
+                let child_chunks = bins.remove(&b).unwrap();
+                let parent_chunks = bins.get_mut(&parent).unwrap();
+                parent_chunks.extend(child_chunks);
+                parent_chunks.sort_unstable_by_key(|c| c.start);
+            }
+        }
+    }
+
+    // Second pass: block-adjacent merge within every remaining bin.
+    for chunks in bins.values_mut() {
+        merge_chunks_block_adjacent(chunks);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Build a tabix index for a BGZF-compressed GFF3 file.
+/// Build a CSI index for a BGZF-compressed GFF3 file.
 ///
 /// Reads from `bgzf_input` (a BGZF-compressed byte stream) and writes the
-/// binary `.tbi` index to `tbi_output`.
-pub fn tabix_index_gff<R: Read, W: Write>(bgzf_input: R, tbi_output: W) -> io::Result<()> {
+/// binary `.csi` index to `csi_output`.
+pub fn csi_index_gff<R: Read, W: Write>(bgzf_input: R, csi_output: W) -> io::Result<()> {
     let mut reader = BgzfReader::new(bgzf_input);
 
     let mut seqs: Vec<SeqIdx> = Vec::new();
@@ -131,7 +263,6 @@ pub fn tabix_index_gff<R: Read, W: Write>(bgzf_input: R, tbi_output: W) -> io::R
         // Split on tabs
         let fields: Vec<&[u8]> = line.splitn(6, |&b| b == b'\t').collect();
         if fields.len() < 5 {
-            // Not enough fields — skip
             continue;
         }
 
@@ -144,10 +275,11 @@ pub fn tabix_index_gff<R: Read, W: Write>(bgzf_input: R, tbi_output: W) -> io::R
 
         // GFF3 columns are 1-based, inclusive → convert to 0-based half-open
         let beg = start_1.saturating_sub(1);
-        let end = end_1; // end_col is already 1-based inclusive = 0-based exclusive
+        let end = end_1;
 
         // Virtual offset after the line
         let voff_end = reader.virtual_offset();
+        let bin = reg2bin(beg, end);
 
         let tid = match seq_map.get(&seqname) {
             Some(&id) => id,
@@ -159,17 +291,14 @@ pub fn tabix_index_gff<R: Read, W: Write>(bgzf_input: R, tbi_output: W) -> io::R
             }
         };
 
-        let bin = reg2bin(beg, end);
         let chunk = Chunk { start: voff_start, end: voff_end };
         seqs[tid].add_chunk(bin, chunk);
         seqs[tid].update_lidx(beg, end, voff_start);
     }
 
-    // Fill trailing zeros in lidx: any 0 slot after the last populated entry
-    // should be set to the current EOF virtual offset.
+    // Fill trailing zeros in lidx.
     let eof_voff = reader.virtual_offset();
     for seq in &mut seqs {
-        // Walk forward: set zero slots after last non-zero to eof_voff
         let mut seen_nonzero = false;
         for slot in seq.lidx.iter_mut() {
             if *slot != 0 {
@@ -180,59 +309,80 @@ pub fn tabix_index_gff<R: Read, W: Write>(bgzf_input: R, tbi_output: W) -> io::R
         }
     }
 
+    // Apply compress_binning and inject pseudo-bin META_BIN per sequence.
+    for seq in &mut seqs {
+        compress_binning(&mut seq.bins);
+
+        let min_voff = if seq.min_voff == u64::MAX { 0 } else { seq.min_voff };
+        seq.bins.insert(
+            META_BIN,
+            vec![
+                Chunk { start: min_voff,      end: seq.max_voff },
+                Chunk { start: seq.n_mapped,  end: 0 },
+            ],
+        );
+    }
+
     // -----------------------------------------------------------------------
-    // Write the .tbi binary format (all little-endian), BGZF-compressed
+    // Write the .csi binary format (all little-endian), BGZF-compressed
     // -----------------------------------------------------------------------
-    let mut w = BgzfWriter::new(tbi_output);
+    let mut w = BgzfWriter::new(csi_output);
 
     // Magic
-    w.write_all(b"TBI\x01")?;
+    w.write_all(b"CSI\x01")?;
 
-    // n_ref
-    write_i32(&mut w, seqs.len() as i32)?;
+    // min_shift, n_lvls
+    w.write_all(&(MIN_SHIFT as i32).to_le_bytes())?;
+    w.write_all(&(N_LVLS as i32).to_le_bytes())?;
 
-    // Header: format, col_seq, col_beg, col_end, meta_char, skip
-    write_i32(&mut w, FORMAT)?;
-    write_i32(&mut w, COL_SEQ)?;
-    write_i32(&mut w, COL_BEG)?;
-    write_i32(&mut w, COL_END)?;
-    write_i32(&mut w, META_CHAR)?;
-    write_i32(&mut w, SKIP)?;
-
-    // l_nm + names (null-terminated, concatenated)
+    // Build names buffer for meta section
     let mut names_buf: Vec<u8> = Vec::new();
     for seq in &seqs {
         names_buf.extend_from_slice(seq.name.as_bytes());
         names_buf.push(0);
     }
-    write_i32(&mut w, names_buf.len() as i32)?;
-    w.write_all(&names_buf)?;
+    let l_nm = names_buf.len() as u32;
+
+    // l_meta = 7 u32 fields (28 bytes) + names blob
+    let l_meta: u32 = 28 + l_nm;
+    w.write_all(&l_meta.to_le_bytes())?;
+
+    // Meta blob: same layout as TBI header fields (1-based column numbers),
+    // stored as u32: preset, col_seq, col_beg, col_end, meta_char, line_skip, l_nm, names.
+    w.write_all(&0u32.to_le_bytes())?;   // preset = TBX_GENERIC
+    w.write_all(&1u32.to_le_bytes())?;   // col_seq = 1 (1-based)
+    w.write_all(&4u32.to_le_bytes())?;   // col_beg = 4 (1-based)
+    w.write_all(&5u32.to_le_bytes())?;   // col_end = 5 (1-based)
+    w.write_all(&35u32.to_le_bytes())?;  // meta_char = '#'
+    w.write_all(&0u32.to_le_bytes())?;   // line_skip = 0
+    w.write_all(&l_nm.to_le_bytes())?;   // l_nm
+    w.write_all(&names_buf)?;            // seq names (null-terminated, concatenated)
+
+    // n_ref
+    w.write_all(&(seqs.len() as i32).to_le_bytes())?;
 
     // Per-sequence index data
     for seq in &seqs {
-        // Collect bins in a stable order (sort by bin number)
         let mut bin_ids: Vec<u32> = seq.bins.keys().cloned().collect();
         bin_ids.sort_unstable();
 
-        write_i32(&mut w, bin_ids.len() as i32)?;
+        w.write_all(&(bin_ids.len() as i32).to_le_bytes())?;
         for bin in &bin_ids {
             let chunks = &seq.bins[bin];
+            let loff = compute_loff(*bin, &seq.lidx);
             w.write_all(&bin.to_le_bytes())?;
-            write_i32(&mut w, chunks.len() as i32)?;
+            w.write_all(&loff.to_le_bytes())?;  // CSI extra field (not in TBI)
+            w.write_all(&(chunks.len() as i32).to_le_bytes())?;
             for chunk in chunks {
                 w.write_all(&chunk.start.to_le_bytes())?;
                 w.write_all(&chunk.end.to_le_bytes())?;
             }
         }
 
-        // Linear index
-        write_i32(&mut w, seq.lidx.len() as i32)?;
-        for &slot in &seq.lidx {
-            w.write_all(&slot.to_le_bytes())?;
-        }
+        // No linear index section in CSI format (omit n_intv + offset array)
     }
 
-    // n_no_coor (unaligned read count) = 0
+    // n_no_coor = 0
     w.write_all(&0u64.to_le_bytes())?;
     w.finish()?;
 
@@ -257,8 +407,4 @@ fn parse_u64(bytes: &[u8]) -> io::Result<u64> {
         .trim();
     s.parse::<u64>()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, format!("cannot parse integer: {:?}", s)))
-}
-
-fn write_i32<W: Write>(w: &mut W, v: i32) -> io::Result<()> {
-    w.write_all(&v.to_le_bytes())
 }

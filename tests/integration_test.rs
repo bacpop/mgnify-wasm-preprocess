@@ -6,22 +6,47 @@
 ///
 /// Fixture files required in `tests/fixtures/`:
 ///   test.fasta, test.gff3
+///   BU_ATCC8492VPI0062_NT5002.1.fa.gz, BU_ATCC8492_annotations.gff.gz
 /// Reference files required in `tests/fixtures/reference/`:
-///   test.fasta.bgz.fai, test.fasta.bgz.gzi, test.gff3.bgz.tbi
+///   test.fasta.bgz.fai, test.fasta.bgz.gzi, test.gff3.bgz.csi
+///   BU_ATCC8492.fasta.bgz.fai, BU_ATCC8492.fasta.bgz.gzi, BU_ATCC8492.gff3.bgz.csi
 /// (Generate them with: tests/generate_references.sh)
 use std::fs;
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 
-use mgnify_wasm::htslib::{bgzf_compress, faidx_index_fasta, tabix_index_gff, BgzfReader};
+use flate2::read::MultiGzDecoder;
+use mgnify_wasm::htslib::{bgzf_compress, csi_index_gff, faidx_index_fasta, BgzfReader};
 
+// --- test.fasta / test.gff3 (plain text) ---
 const FASTA_FIXTURE: &str = "tests/fixtures/test.fasta";
 const GFF_FIXTURE:   &str = "tests/fixtures/test.gff3";
 const REF_FAI:       &str = "tests/fixtures/reference/test.fasta.bgz.fai";
 const REF_GZI:       &str = "tests/fixtures/reference/test.fasta.bgz.gzi";
-const REF_TBI:       &str = "tests/fixtures/reference/test.gff3.bgz.tbi";
+const REF_CSI:       &str = "tests/fixtures/reference/test.gff3.bgz.csi";
+
+// --- BU_ATCC8492 (gzip-compressed fixtures) ---
+const BU_FASTA_FIXTURE: &str = "tests/fixtures/BU_ATCC8492VPI0062_NT5002.1.fa.gz";
+const BU_GFF_FIXTURE:   &str = "tests/fixtures/BU_ATCC8492_annotations.gff.gz";
+const REF_BU_FAI:       &str = "tests/fixtures/reference/BU_ATCC8492.fasta.bgz.fai";
+const REF_BU_GZI:       &str = "tests/fixtures/reference/BU_ATCC8492.fasta.bgz.gzi";
+const REF_BU_CSI:       &str = "tests/fixtures/reference/BU_ATCC8492.gff3.bgz.csi";
 
 fn read_fixture(path: &str) -> Vec<u8> {
     fs::read(path).unwrap_or_else(|e| panic!("cannot read {}: {}\n  (run tests/generate_references.sh to create reference files)", path, e))
+}
+
+/// Read a file, transparently decompressing if it begins with the gzip magic bytes.
+fn read_maybe_gz(path: &str) -> Vec<u8> {
+    let raw = read_fixture(path);
+    if raw.starts_with(&[0x1F, 0x8B]) {
+        let mut decoder = MultiGzDecoder::new(raw.as_slice());
+        let mut out = Vec::new();
+        decoder.read_to_end(&mut out)
+            .unwrap_or_else(|e| panic!("gzip decode failed for {}: {}", path, e));
+        out
+    } else {
+        raw
+    }
 }
 
 fn compress_fasta() -> Vec<u8> {
@@ -39,6 +64,86 @@ fn compress_gff() -> Vec<u8> {
     bgzf_compress(Cursor::new(preprocessed.as_bytes()), &mut bgzf).expect("bgzf_compress failed");
     bgzf
 }
+
+fn compress_bu_fasta() -> Vec<u8> {
+    let raw = read_maybe_gz(BU_FASTA_FIXTURE);
+    let mut bgzf = Vec::new();
+    bgzf_compress(Cursor::new(raw), &mut bgzf).expect("bgzf_compress failed (BU fasta)");
+    bgzf
+}
+
+fn compress_bu_gff() -> Vec<u8> {
+    let raw_bytes = read_maybe_gz(BU_GFF_FIXTURE);
+    let raw = String::from_utf8(raw_bytes)
+        .unwrap_or_else(|e| panic!("non-UTF8 in {}: {}", BU_GFF_FIXTURE, e));
+    let preprocessed = mgnify_wasm::gff_preprocess(&raw);
+    let mut bgzf = Vec::new();
+    bgzf_compress(Cursor::new(preprocessed.as_bytes()), &mut bgzf).expect("bgzf_compress failed (BU gff)");
+    bgzf
+}
+
+// ---------------------------------------------------------------------------
+// CSI normalisation helper
+// ---------------------------------------------------------------------------
+
+/// Parse a raw (decompressed) CSI blob and re-serialise it with bins sorted
+/// ascending by bin number and chunks sorted ascending by start offset within
+/// each bin.  This makes the comparison robust to hash-table iteration order
+/// differences between our implementation and htslib.
+fn normalize_csi(csi: &[u8]) -> Vec<u8> {
+    // magic (4) + min_shift (4) + n_lvls (4) = 12 bytes
+    assert!(csi.len() >= 16, "CSI blob too short for header");
+    let l_meta = u32::from_le_bytes(csi[12..16].try_into().unwrap()) as usize;
+    let header_end = 16 + l_meta;
+    assert!(csi.len() >= header_end + 4, "CSI blob too short for n_ref");
+    let mut pos = header_end;
+
+    let mut out = csi[0..header_end].to_vec();
+
+    let n_ref = i32::from_le_bytes(csi[pos..pos + 4].try_into().unwrap());
+    pos += 4;
+    out.extend_from_slice(&n_ref.to_le_bytes());
+
+    for _ in 0..n_ref {
+        let n_bin = i32::from_le_bytes(csi[pos..pos + 4].try_into().unwrap());
+        pos += 4;
+
+        let mut bins: Vec<(u32, u64, Vec<(u64, u64)>)> = Vec::new();
+        for _ in 0..n_bin {
+            let bin  = u32::from_le_bytes(csi[pos..pos + 4].try_into().unwrap()); pos += 4;
+            let loff = u64::from_le_bytes(csi[pos..pos + 8].try_into().unwrap()); pos += 8;
+            let n_chunk = i32::from_le_bytes(csi[pos..pos + 4].try_into().unwrap()); pos += 4;
+            let mut chunks: Vec<(u64, u64)> = Vec::new();
+            for _ in 0..n_chunk {
+                let s = u64::from_le_bytes(csi[pos..pos + 8].try_into().unwrap()); pos += 8;
+                let e = u64::from_le_bytes(csi[pos..pos + 8].try_into().unwrap()); pos += 8;
+                chunks.push((s, e));
+            }
+            chunks.sort_unstable();
+            bins.push((bin, loff, chunks));
+        }
+        bins.sort_by_key(|&(b, _, _)| b);
+
+        out.extend_from_slice(&n_bin.to_le_bytes());
+        for (bin, loff, chunks) in bins {
+            out.extend_from_slice(&bin.to_le_bytes());
+            out.extend_from_slice(&loff.to_le_bytes());
+            out.extend_from_slice(&(chunks.len() as i32).to_le_bytes());
+            for (s, e) in chunks {
+                out.extend_from_slice(&s.to_le_bytes());
+                out.extend_from_slice(&e.to_le_bytes());
+            }
+        }
+    }
+
+    // n_no_coor (8 bytes)
+    out.extend_from_slice(&csi[pos..]);
+    out
+}
+
+// ---------------------------------------------------------------------------
+// test.fasta / test.gff3 tests
+// ---------------------------------------------------------------------------
 
 /// Compressing and then decompressing a FASTA returns the original bytes.
 #[test]
@@ -100,29 +205,118 @@ fn gzi_matches_samtools() {
     assert_eq!(ref_gzi, our_gzi, ".gzi does not match samtools reference");
 }
 
-/// Our `.tbi` index matches the reference produced by `tabix`.
+/// Our `.csi` index matches the reference produced by `tabix -C`.
 /// Both files are BGZF-compressed; we decompress before comparing so that
 /// differences in deflate implementation do not cause spurious failures.
 #[test]
-fn tbi_matches_tabix() {
+fn csi_matches_tabix() {
     let bgzf = compress_gff();
-    let ref_tbi_bgzf = read_fixture(REF_TBI);
+    let ref_csi_bgzf = read_fixture(REF_CSI);
 
-    let mut our_tbi_bgzf = Vec::new();
-    tabix_index_gff(Cursor::new(&bgzf), &mut our_tbi_bgzf).expect("tabix_index_gff failed");
+    let mut our_csi_bgzf = Vec::new();
+    csi_index_gff(Cursor::new(&bgzf), &mut our_csi_bgzf).expect("csi_index_gff failed");
 
     // Decompress both for comparison
-    let mut ref_tbi = Vec::new();
+    let mut ref_csi = Vec::new();
     std::io::Read::read_to_end(
-        &mut BgzfReader::new(Cursor::new(&ref_tbi_bgzf)),
-        &mut ref_tbi,
-    ).expect("decompressing reference TBI failed");
+        &mut BgzfReader::new(Cursor::new(&ref_csi_bgzf)),
+        &mut ref_csi,
+    ).expect("decompressing reference CSI failed");
 
-    let mut our_tbi = Vec::new();
+    let mut our_csi = Vec::new();
     std::io::Read::read_to_end(
-        &mut BgzfReader::new(Cursor::new(&our_tbi_bgzf)),
-        &mut our_tbi,
-    ).expect("decompressing our TBI failed");
+        &mut BgzfReader::new(Cursor::new(&our_csi_bgzf)),
+        &mut our_csi,
+    ).expect("decompressing our CSI failed");
 
-    assert_eq!(ref_tbi, our_tbi, ".tbi does not match tabix reference");
+    assert_eq!(normalize_csi(&ref_csi), normalize_csi(&our_csi), ".csi does not match tabix reference");
+}
+
+// ---------------------------------------------------------------------------
+// BU_ATCC8492 tests
+// ---------------------------------------------------------------------------
+
+/// Compressing and then decompressing the BU FASTA returns the original bytes.
+#[test]
+fn bgzf_roundtrip_bu_fasta() {
+    let original = read_maybe_gz(BU_FASTA_FIXTURE);
+    let bgzf = compress_bu_fasta();
+
+    let mut decompressed = Vec::new();
+    let mut reader = BgzfReader::new(Cursor::new(&bgzf));
+    std::io::Read::read_to_end(&mut reader, &mut decompressed).expect("BgzfReader failed");
+
+    assert_eq!(decompressed, original, "decompressed BU FASTA differs from original");
+}
+
+/// Compressing and then decompressing the BU GFF returns the preprocessed bytes.
+#[test]
+fn bgzf_roundtrip_bu_gff() {
+    let raw_bytes = read_maybe_gz(BU_GFF_FIXTURE);
+    let raw = String::from_utf8(raw_bytes).expect("BU GFF not valid UTF-8");
+    let preprocessed = mgnify_wasm::gff_preprocess(&raw);
+    let bgzf = compress_bu_gff();
+
+    let mut decompressed = Vec::new();
+    let mut reader = BgzfReader::new(Cursor::new(&bgzf));
+    std::io::Read::read_to_end(&mut reader, &mut decompressed).expect("BgzfReader failed");
+
+    assert_eq!(decompressed, preprocessed.as_bytes(), "decompressed BU GFF differs from preprocessed original");
+}
+
+/// Our BU `.fai` index matches the reference produced by `samtools faidx`.
+#[test]
+fn bu_fai_matches_samtools() {
+    let bgzf = compress_bu_fasta();
+    let ref_fai = read_fixture(REF_BU_FAI);
+
+    let mut our_fai = Vec::new();
+    let mut _gzi = Vec::new();
+    faidx_index_fasta(Cursor::new(&bgzf), &mut our_fai, &mut _gzi)
+        .expect("faidx_index_fasta failed");
+
+    pretty_assertions::assert_eq!(
+        String::from_utf8_lossy(&ref_fai),
+        String::from_utf8_lossy(&our_fai),
+        "BU .fai does not match samtools reference"
+    );
+}
+
+/// Our BU `.gzi` index matches the reference produced by `samtools faidx`.
+#[test]
+fn bu_gzi_matches_samtools() {
+    let bgzf = compress_bu_fasta();
+    let ref_gzi = read_fixture(REF_BU_GZI);
+
+    let mut _fai = Vec::new();
+    let mut our_gzi = Vec::new();
+    faidx_index_fasta(Cursor::new(&bgzf), &mut _fai, &mut our_gzi)
+        .expect("faidx_index_fasta failed");
+
+    assert_eq!(ref_gzi, our_gzi, "BU .gzi does not match samtools reference");
+}
+
+/// Our BU `.csi` index matches the reference produced by `tabix -C`.
+#[test]
+fn bu_csi_matches_tabix() {
+    let bgzf = compress_bu_gff();
+    let ref_csi_bgzf = read_fixture(REF_BU_CSI);
+
+    let mut our_csi_bgzf = Vec::new();
+    csi_index_gff(Cursor::new(&bgzf), &mut our_csi_bgzf).expect("csi_index_gff failed");
+
+    // Decompress both for comparison
+    let mut ref_csi = Vec::new();
+    std::io::Read::read_to_end(
+        &mut BgzfReader::new(Cursor::new(&ref_csi_bgzf)),
+        &mut ref_csi,
+    ).expect("decompressing reference BU CSI failed");
+
+    let mut our_csi = Vec::new();
+    std::io::Read::read_to_end(
+        &mut BgzfReader::new(Cursor::new(&our_csi_bgzf)),
+        &mut our_csi,
+    ).expect("decompressing our BU CSI failed");
+
+    assert_eq!(normalize_csi(&ref_csi), normalize_csi(&our_csi), "BU .csi does not match tabix reference");
 }

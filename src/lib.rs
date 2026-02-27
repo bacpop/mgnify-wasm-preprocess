@@ -8,7 +8,7 @@ extern crate console_error_panic_hook;
 mod decompress;
 
 pub mod htslib;
-use crate::htslib::{compress_bgzf, index_gff_tbi, index_fasta_fai, FaidxResult};
+use crate::htslib::{compress_bgzf, index_gff_csi, index_fasta_fai, FaidxResult};
 
 #[wasm_bindgen]
 extern "C" {
@@ -86,7 +86,7 @@ impl IndexGen {
         logw("Compressing and indexing gff", None);
         // bgzip
         let gff_bgz = compress_bgzf(gff_string.as_bytes());
-        let gff_idx = index_gff_tbi(&gff_bgz);
+        let gff_idx = index_gff_csi(&gff_bgz);
 
         Self {
             fasta_bgz,
@@ -117,7 +117,7 @@ impl IndexGen {
         vec_to_blob(std::mem::take(&mut self.gff_bgz))
     }
 
-    /// Returns the GFF3 `.tbi` tabix index as a Blob. Drains the field; call once.
+    /// Returns the GFF3 `.csi` tabix index as a Blob. Drains the field; call once.
     pub fn gff_tbi_blob(&mut self) -> Result<web_sys::Blob, JsValue> {
         vec_to_blob(std::mem::take(&mut self.gff_idx))
     }

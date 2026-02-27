@@ -25,6 +25,7 @@ log                      = {version = "0.4.27"}
 # testing
 pretty_assertions = "1.4.1"
 stacker = "0.1.20"
+flate2 = "1.0"
 
 [[example]]
 name = "gen_references"
