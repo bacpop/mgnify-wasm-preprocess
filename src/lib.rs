@@ -118,7 +118,7 @@ impl IndexGen {
     }
 
     /// Returns the GFF3 `.csi` tabix index as a Blob. Drains the field; call once.
-    pub fn gff_tbi_blob(&mut self) -> Result<web_sys::Blob, JsValue> {
+    pub fn gff_csi_blob(&mut self) -> Result<web_sys::Blob, JsValue> {
         vec_to_blob(std::mem::take(&mut self.gff_idx))
     }
 }
