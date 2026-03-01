@@ -241,11 +241,11 @@ itself will refuse to index an unsorted file.
 src/
   lib.rs              — WASM entry point (IndexGen), gff_preprocess()
   decompress.rs       — transparent gzip detection/decompression
+  htslib.rs           — wasm-bindgen exports, re-exports submodule APIs
   htslib/
     bgzf.rs           — BgzfWriter, BgzfReader, bgzf_compress()
     faidx.rs          — faidx_index_fasta() → .fai + .gzi
     tabix.rs          — csi_index_gff() → .csi
-    mod.rs            — wasm-bindgen exports
 
 examples/
   gen_references.rs   — CLI tool used by generate_references.sh
